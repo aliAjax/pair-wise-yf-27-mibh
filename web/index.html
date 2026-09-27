@@ -1,4 +1,127 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>藏品来源与返还审查</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>藏品来源与返还审查</h1><div class="panel"><select id="user"><option>staff</option><option>reviewer1</option><option>claimant1</option><option>public</option></select><button onclick="load()">查看当前角色可见藏品</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch("/api/objects",{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>藏品来源与返还审查 · 来源签证</title>
+<style>
+body{font:15px system-ui;max-width:1080px;margin:24px auto;padding:0 16px;color:#222}
+.panel{border:1px solid #ccc;border-radius:8px;padding:14px;margin:10px 0}
+.ok{border-color:#2e7d32;background:#f1f8f2}
+.bad{border-color:#c62828;background:#fdf1f1}
+.warn{border-color:#f9a825;background:#fffaf0}
+button,select,input{padding:6px 8px;margin:3px}
+input{width:150px}
+pre{background:#f5f5f5;padding:10px;white-space:pre-wrap;border-radius:6px;max-height:300px;overflow:auto}
+.tag{display:inline-block;padding:2px 10px;border-radius:10px;font-size:13px;color:#fff}
+.tag.ok{background:#2e7d32}.tag.bad{background:#c62828}.tag.warn{background:#f9a825}
+h2{font-size:18px;margin:6px 0}h3{font-size:15px;margin:10px 0 4px}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:4px 8px;text-align:left;font-size:14px}
+fieldset{border:1px solid #ddd;border-radius:6px;margin:8px 0}
+.step{color:#555}
+</style>
+</head>
+<body>
+<h1>藏品来源与返还审查 · 来源签证演示</h1>
+<div class="panel">
+  角色 <select id="user" onchange="loadAll()">
+    <option value="staff">staff 藏品研究员</option>
+    <option value="reviewer1">reviewer1 返还审查员</option>
+    <option value="claimant1">claimant1 权利主张人</option>
+    <option value="public">public 公众访客</option>
+  </select>
+  藏品 <select id="obj" onchange="loadAll()"></select>
+  <button onclick="loadAll()">刷新</button>
+  <div class="step">演示流程：① staff 生成演示藏品 → ② claimant1 提交主张 → ③ reviewer1 进入审查并签证 → ④ 进入协商 → ⑤ staff 补一条公开流转事件（签证失效）→ ⑥ reviewer1 尝试完成返还被挡，查看失效原因 → ⑦ staff 补来源与内部证据 → ⑧ reviewer1 重签并完成返还。各角色可随时切换查看签证状态。</div>
+</div>
+<div id="att"></div>
+<div id="detail"></div>
+<div class="panel"><h2>角色操作</h2><div id="actions"></div></div>
+<h3>最近一次请求结果</h3><pre id="out">—</pre>
+<script>
+const $=id=>document.getElementById(id);
+async function api(path,method="GET",body){
+  const opt={method,headers:{"X-User-Id":$("user").value,"Content-Type":"application/json"}};
+  if(body)opt.body=JSON.stringify(body);
+  const r=await fetch(path,opt);const j=await r.json();
+  $("out").textContent=JSON.stringify(j,null,2);return j;
+}
+const b64=s=>btoa(unescape(encodeURIComponent(s)));
+async function loadObjects(){
+  const j=await api("/api/objects");const sel=$("obj");const cur=sel.value;
+  sel.innerHTML=(j.items||[]).map(o=>`<option value="${o.id}">#${o.id} ${o.inventory_no} ${o.title}</option>`).join("");
+  if(cur&&[...sel.options].some(o=>o.value===cur))sel.value=cur;
+}
+async function loadAll(){
+  await loadObjects();renderActions();
+  const id=$("obj").value;
+  if(!id){$("att").innerHTML="";$("detail").innerHTML="";return;}
+  renderAtt(await api(`/api/objects/${id}/attestation`));
+  renderDetail(await api(`/api/objects/${id}`));
+}
+function renderAtt(a){
+  if(a.error){$("att").innerHTML=`<div class="panel bad">${a.error.message}</div>`;return;}
+  let cls=a.status==="valid"?"ok":a.status==="invalid"?"bad":"warn";
+  let label={valid:"签证有效",invalid:"签证已失效",missing:"尚未签证"}[a.status]||a.status;
+  let html=`<div class="panel ${cls}"><h2>来源签证 <span class="tag ${cls}">${label}</span></h2>`;
+  if(a.attestation){
+    const t=a.attestation;
+    html+=`<div>签证 #${t.id} · 审查员 ${t.reviewer_id} · 基于藏品版本 ${t.object_version}（当前版本 ${a.current_version}）· ${t.created_at}</div>
+    <div>证据摘要：${t.summary}</div><div>材料指纹：${t.evidence_digest.slice(0,16)}… ${t.note?`· 备注：${t.note}`:""}</div>`;
+  }
+  if(a.invalid_reason)html+=`<div><b>失效原因：</b>${a.invalid_reason}</div>`;
+  if(a.missing&&a.missing.length)html+=`<div><b>待补齐：</b><ul>${a.missing.map(m=>`<li>${m}</li>`).join("")}</ul></div>`;
+  $("att").innerHTML=html+"</div>";
+}
+function renderDetail(o){
+  if(o.error){$("detail").innerHTML="";return;}
+  const ev=(o.events||[]).map(e=>`<tr><td>#${e.id}</td><td>${e.event_type}</td><td>${e.date_start}</td><td>${e.visibility}</td>
+    <td>${e.source?e.source.name+"("+e.source.reference+")":"—"}</td>
+    <td>${(e.evidence||[]).map(x=>x.filename+"["+x.visibility+"]").join("、")||"—"}</td></tr>`).join("");
+  const cl=(o.claims||[]).map(c=>`<tr><td>#${c.id}</td><td>${c.claimed_by}</td><td>${c.desired_outcome}</td><td><b>${c.status}</b></td></tr>`).join("");
+  $("detail").innerHTML=`<div class="panel"><h2>藏品 #${o.id} ${o.title}（版本 ${o.version}）</h2>
+    <div>${o.inventory_no} · ${o.object_type}${o.current_holder?" · 持有人："+o.current_holder:""} · ${o.public_summary}</div>
+    <h3>流转事件</h3><table><tr><th>ID</th><th>类型</th><th>日期</th><th>可见性</th><th>来源</th><th>证据</th></tr>${ev||"<tr><td colspan=6>无</td></tr>"}</table>
+    <h3>权利主张</h3><table><tr><th>ID</th><th>主张人</th><th>期望结果</th><th>状态</th></tr>${cl||"<tr><td colspan=4>无</td></tr>"}</table></div>`;
+}
+function renderActions(){
+  const role=$("user").value,oid=$("obj").value||"";
+  const F=(t,inner)=>`<fieldset><legend>${t}</legend>${inner}</fieldset>`;
+  let h="";
+  if(role==="staff"){
+    h+=F("① 生成演示藏品","<button onclick='demoSeed()'>创建藏品+来源+公开事件+内部证据</button>");
+    h+=F("登记来源","名称<input id='s_name'> 引用编号<input id='s_ref'> <button onclick='addSource()'>提交</button>");
+    h+=F("⑤ 新增流转事件（不带来源可演示签证失效）","类型<input id='e_type' value='exhibition'> 日期<input id='e_date' value='1972-03-01'> 地点<input id='e_place' value='首都'> 说明<input id='e_desc' value='战后公开展出'> 来源ID<input id='e_src' style='width:60px'> 可见性<select id='e_vis'><option>public</option><option>internal</option></select> <button onclick='addEvent()'>提交</button>");
+    h+=F("⑦ 事件补登记来源","事件ID<input id='m_eid' style='width:60px'> 来源ID<input id='m_sid' style='width:60px'> <button onclick='amendSource()'>补登记</button>");
+    h+=F("⑦ 上传内部证据","事件ID<input id='v_eid' style='width:60px'> 文件名<input id='v_file' value='catalog.pdf'> 内容<input id='v_text' value='exhibition catalog'> 可见性<select id='v_vis'><option>internal</option><option>public</option></select> <button onclick='uploadEv()'>上传</button>");
+    h+=F("更新公开简介（也会使签证失效）","<input id='u_sum' style='width:320px' value='简介已修订。'> <button onclick='updateObj()'>更新</button>");
+  }else if(role==="claimant1"){
+    h+=F("② 提交权利主张","主张人<input id='c_by' value='原藏家后裔'> 期望结果<input id='c_out' value='返还藏品'> <button onclick='addClaim()'>提交</button>");
+  }else if(role==="reviewer1"){
+    h+=F("③⑧ 来源签证（确认公开事件均有来源与内部证据）","备注<input id='a_note' value='复审通过'> <button onclick='attest()'>签证 / 重签</button>");
+    h+=F("④⑥ 主张阶段流转","主张ID<input id='t_cid' style='width:60px'> 目标<select id='t_st'><option>under_review</option><option>negotiating</option><option>resolved_return</option><option>rejected</option></select> 说明<input id='t_note' value='审查说明记录'> <button onclick='transition()'>流转</button>");
+  }else{
+    h="<div class='step'>公众访客为只读视图，可查看藏品公开信息与签证状态。</div>";
+  }
+  $("actions").innerHTML=h;
+}
+async function demoSeed(){
+  const inv="M-"+String(Date.now()).slice(-6);
+  const o=await api("/api/objects","POST",{inventory_no:inv,title:"演示青铜器",object_type:"礼器",current_holder:"市博物馆",public_summary:"1999年入藏，来源待持续核验。"});
+  if(o.error)return;
+  const s=await api("/api/sources","POST",{name:"购藏档案",source_type:"archive",reference:"ACC-"+inv});
+  const e=await api(`/api/objects/${o.id}/events`,"POST",{event_type:"acquisition",date_start:"1999-07-01",place:"本市",description:"从私人藏家购入",source_id:s.id,visibility:"public"});
+  await api(`/api/objects/${o.id}/evidence`,"POST",{filename:"purchase.pdf",content_b64:b64("purchase record"),visibility:"internal",event_id:e.id});
+  await loadAll();$("obj").value=String(o.id);await loadAll();
+}
+async function addSource(){await api("/api/sources","POST",{name:$("s_name").value,source_type:"archive",reference:$("s_ref").value});await loadAll();}
+async function addEvent(){await api(`/api/objects/${$("obj").value}/events`,"POST",{event_type:$("e_type").value,date_start:$("e_date").value,place:$("e_place").value,description:$("e_desc").value,source_id:$("e_src").value?Number($("e_src").value):null,visibility:$("e_vis").value});await loadAll();}
+async function amendSource(){await api(`/api/events/${$("m_eid").value}/source`,"POST",{source_id:Number($("m_sid").value)});await loadAll();}
+async function uploadEv(){await api(`/api/objects/${$("obj").value}/evidence`,"POST",{filename:$("v_file").value,content_b64:b64($("v_text").value),visibility:$("v_vis").value,event_id:$("v_eid").value?Number($("v_eid").value):null});await loadAll();}
+async function updateObj(){await api(`/api/objects/${$("obj").value}/update`,"POST",{changes:{public_summary:$("u_sum").value}});await loadAll();}
+async function addClaim(){await api(`/api/objects/${$("obj").value}/claims`,"POST",{claimed_by:$("c_by").value,desired_outcome:$("c_out").value});await loadAll();}
+async function attest(){await api(`/api/objects/${$("obj").value}/attest`,"POST",{note:$("a_note").value});await loadAll();}
+async function transition(){await api(`/api/claims/${$("t_cid").value}/transition`,"POST",{status:$("t_st").value,note:$("t_note").value});await loadAll();}
+loadAll();
+</script>
+</body>
+</html>

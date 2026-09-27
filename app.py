@@ -25,9 +25,9 @@ CLAIM_TRANSITIONS = {
 
 
 class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
+    def __init__(self, message, status=400, code="bad_request", detail=None):
         super().__init__(message)
-        self.message, self.status, self.code = message, status, code
+        self.message, self.status, self.code, self.detail = message, status, code, detail
 
 
 def now():
@@ -107,6 +107,14 @@ class ProvenanceStore:
                     changed_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
                     UNIQUE(object_id,version)
                 );
+                CREATE TABLE IF NOT EXISTS attestations(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    object_id INTEGER NOT NULL REFERENCES objects(id),
+                    object_version INTEGER NOT NULL,
+                    reviewer_id TEXT NOT NULL REFERENCES users(id),
+                    evidence_digest TEXT NOT NULL, material_summary TEXT NOT NULL,
+                    note TEXT NOT NULL, created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, object_id INTEGER REFERENCES objects(id),
                     actor_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL,
@@ -161,6 +169,126 @@ class ProvenanceStore:
             "INSERT INTO object_versions(object_id,version,snapshot,changed_by,created_at) VALUES(?,?,?,?,?)",
             (object_id, row["version"], json.dumps(snapshot, ensure_ascii=False, sort_keys=True), actor, now()),
         )
+
+    def _material(self, conn, object_id):
+        """签证覆盖的来源材料：藏品登记字段、全部流转事件、全部证据。"""
+        obj = self._object(conn, object_id)
+        return {
+            "object": {k: obj[k] for k in ("inventory_no", "title", "object_type", "current_holder", "public_summary")},
+            "events": [dict(e) for e in conn.execute(
+                "SELECT id,event_type,date_start,date_end,place,description,source_id,visibility FROM events WHERE object_id=? ORDER BY id",
+                (object_id,)).fetchall()],
+            "evidence": [dict(e) for e in conn.execute(
+                "SELECT id,event_id,filename,sha256,size,visibility FROM evidence WHERE object_id=? ORDER BY id",
+                (object_id,)).fetchall()],
+        }
+
+    def _material_digest(self, material):
+        canonical = json.dumps(material, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def _missing_material(self, conn, object_id):
+        """公开流转事件必须具备来源登记和内部证据，否则不能签证。"""
+        gaps = []
+        events = conn.execute(
+            "SELECT * FROM events WHERE object_id=? AND visibility='public' ORDER BY id", (object_id,)).fetchall()
+        for e in events:
+            label = f"事件#{e['id']}({e['event_type']} {e['date_start']})"
+            if not e["source_id"]:
+                gaps.append(f"{label} 缺少来源登记")
+            internal = conn.execute(
+                "SELECT COUNT(*) AS c FROM evidence WHERE event_id=? AND visibility='internal'", (e["id"],)).fetchone()["c"]
+            if internal == 0:
+                gaps.append(f"{label} 缺少内部证据")
+        return gaps
+
+    def _summarize(self, material):
+        public_events = [e for e in material["events"] if e["visibility"] == "public"]
+        ev = material["evidence"]
+        hashes = "、".join(f"{x['filename']}:{x['sha256'][:12]}" for x in ev) or "无"
+        return f"公开流转事件 {len(public_events)} 件均已登记来源并附内部证据；证据 {len(ev)} 份（{hashes}）"
+
+    def _attestation_view(self, conn, obj):
+        object_id = obj["id"]
+        att = conn.execute(
+            "SELECT * FROM attestations WHERE object_id=? ORDER BY id DESC LIMIT 1", (object_id,)).fetchone()
+        material = self._material(conn, object_id)
+        digest = self._material_digest(material)
+        view = {"object_id": object_id, "current_version": obj["version"],
+                "missing": self._missing_material(conn, object_id)}
+        if not att:
+            return view | {"status": "missing", "valid": False, "attestation": None}
+        view["attestation"] = {
+            "id": att["id"], "object_version": att["object_version"], "reviewer_id": att["reviewer_id"],
+            "evidence_digest": att["evidence_digest"], "note": att["note"], "created_at": att["created_at"],
+            "summary": self._summarize(json.loads(att["material_summary"])),
+        }
+        if att["evidence_digest"] == digest:
+            return view | {"status": "valid", "valid": True}
+        old = json.loads(att["material_summary"])
+        reasons = []
+        if old["object"] != material["object"]:
+            reasons.append("藏品登记信息已变更")
+        old_event_ids = {e["id"] for e in old["events"]}
+        added_events = [e for e in material["events"] if e["id"] not in old_event_ids]
+        if added_events:
+            reasons.append(f"新增 {len(added_events)} 条流转事件")
+        old_ev = {e["id"]: e["sha256"] for e in old["evidence"]}
+        cur_ev = {e["id"]: e["sha256"] for e in material["evidence"]}
+        changed = [i for i in cur_ev if i not in old_ev or old_ev[i] != cur_ev[i]]
+        removed = [i for i in old_ev if i not in cur_ev]
+        if changed or removed:
+            reasons.append(f"新增或更换 {len(changed) + len(removed)} 份证据")
+        reason = "；".join(reasons) or "来源材料已变化"
+        return view | {"status": "invalid", "valid": False,
+                       "invalid_reason": f"{reason}（签证基于版本 {att['object_version']}，当前版本 {obj['version']}）"}
+
+    def attest_object(self, user_id, object_id, note=""):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"reviewer"})
+            obj = self._object(conn, object_id)
+            gaps = self._missing_material(conn, object_id)
+            if gaps:
+                raise BusinessError("公开流转事件尚未补齐来源或内部证据，不能签证", 422, "attestation_incomplete", {"missing": gaps})
+            material = self._material(conn, object_id)
+            digest = self._material_digest(material)
+            cur = conn.execute(
+                """INSERT INTO attestations(object_id,object_version,reviewer_id,evidence_digest,material_summary,note,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (object_id, obj["version"], user_id, digest,
+                 json.dumps(material, ensure_ascii=False, sort_keys=True), note.strip(), now()),
+            )
+            self._audit(conn, object_id, user_id, "object.attest",
+                        {"attestation_id": cur.lastrowid, "object_version": obj["version"], "evidence_digest": digest})
+            return {"id": cur.lastrowid, "object_id": object_id, "object_version": obj["version"],
+                    "evidence_digest": digest, "valid": True}
+
+    def attestation_status(self, user_id, object_id):
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            obj = self._object(conn, object_id)
+            view = self._attestation_view(conn, obj)
+            if user["role"] in {"public", "claimant"}:
+                # 公众与主张人只看签证状态与失效原因，不看内部证据摘要。
+                return {k: view[k] for k in ("object_id", "current_version", "status", "valid", "invalid_reason") if k in view}
+            return view
+
+    def amend_event_source(self, user_id, event_id, source_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff"})
+            event = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+            if not event:
+                raise BusinessError("事件不存在", 404, "not_found")
+            if not conn.execute("SELECT 1 FROM sources WHERE id=?", (source_id,)).fetchone():
+                raise BusinessError("来源不存在", 404, "source_not_found")
+            conn.execute("UPDATE events SET source_id=? WHERE id=?", (source_id, event_id))
+            obj = self._object(conn, event["object_id"])
+            new_version = obj["version"] + 1
+            conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (new_version, now(), event["object_id"]))
+            self._snapshot(conn, event["object_id"], user_id)
+            self._audit(conn, event["object_id"], user_id, "event.amend_source",
+                        {"event_id": event_id, "source_id": source_id, "version": new_version})
+            return {"event_id": event_id, "source_id": source_id, "object_version": new_version}
 
     def create_object(self, user_id, inventory_no, title, object_type, holder, public_summary):
         inventory_no, title = inventory_no.strip(), title.strip()
@@ -291,12 +419,18 @@ class ProvenanceStore:
                 allowed = CLAIM_TRANSITIONS.get(claim["status"], set())
                 if new_status not in allowed:
                     raise BusinessError(f"不能从 {claim['status']} 直接变更为 {new_status}", 409, "invalid_transition")
+                if new_status in {"negotiating", "resolved_return"}:
+                    view = self._attestation_view(conn, self._object(conn, claim["object_id"]))
+                    if not view["valid"]:
+                        reason = view.get("invalid_reason") or "尚未完成来源签证"
+                        raise BusinessError(
+                            f"来源签证无效（{reason}），需审查员重新签证后才能进入 {new_status}",
+                            409, "attestation_required")
                 conn.execute("UPDATE claims SET status=?,updated_at=? WHERE id=?", (new_status, now(), claim_id))
                 conn.execute(
                     "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)",
                     (claim_id, user_id, claim["status"], new_status, note.strip(), now()),
                 )
-                new_version = claim["object_id"]
                 obj = self._object(conn, claim["object_id"])
                 next_version = obj["version"] + 1
                 conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (next_version, now(), claim["object_id"]))
@@ -335,6 +469,7 @@ class ProvenanceStore:
                            for c in conn.execute("SELECT * FROM claims WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
                 "unlinked_evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE object_id=? AND event_id IS NULL ORDER BY id", (object_id,)).fetchall()],
             }
+            view = self._attestation_view(conn, obj)
             if user["role"] == "claimant":
                 # 主张人只看到公开来源事件和自己的主张，不能浏览内部调查材料。
                 result["events"] = [e for e in result["events"] if e["visibility"] == "public"]
@@ -342,6 +477,9 @@ class ProvenanceStore:
                 result["claims"] = [c for c in result["claims"] if c["claimant_id"] == user_id]
                 for c in result["claims"]:
                     c.pop("claimant_id", None)
+                result["attestation"] = {k: view[k] for k in ("status", "valid", "invalid_reason") if k in view}
+            else:
+                result["attestation"] = view
             return result
 
     def list_objects(self, user_id):
@@ -422,15 +560,23 @@ class Handler(BaseHTTPRequestHandler):
                 d = self._body(); return self._send(201, store.upload_evidence(user, object_id, d.get("filename", ""), d.get("content_b64", ""), d.get("visibility", "internal"), d.get("event_id")))
             if len(parts) == 4 and parts[3] == "claims" and method == "POST":
                 d = self._body(); return self._send(201, store.create_claim(user, object_id, d.get("claimed_by", ""), d.get("desired_outcome", "")))
+            if len(parts) == 4 and parts[3] == "attest" and method == "POST":
+                d = self._body(); return self._send(201, store.attest_object(user, object_id, d.get("note", "")))
+            if len(parts) == 4 and parts[3] == "attestation" and method == "GET": return self._send(200, store.attestation_status(user, object_id))
             if len(parts) == 4 and parts[3] == "history" and method == "GET": return self._send(200, {"items": store.object_history(user, object_id)})
             if len(parts) == 5 and parts[3] == "history" and method == "GET": return self._send(200, store.history_detail(user, object_id, int(parts[4])))
+        if len(parts) == 4 and parts[:2] == ["api", "events"] and parts[3] == "source" and method == "POST":
+            d = self._body(); return self._send(200, store.amend_event_source(user, int(parts[2]), d.get("source_id")))
         if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "transition" and method == "POST":
             d = self._body(); return self._send(200, store.transition_claim(user, int(parts[2]), d.get("status", ""), d.get("note", "")))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method):
         try: self._dispatch(method)
-        except BusinessError as exc: self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+        except BusinessError as exc:
+            err = {"code": exc.code, "message": exc.message}
+            if exc.detail is not None: err["detail"] = exc.detail
+            self._send(exc.status, {"error": err})
         except (ValueError, TypeError): self._send(400, {"error": {"code": "invalid_path", "message": "路径参数格式错误"}})
         except Exception as exc: self._send(500, {"error": {"code": "internal_error", "message": str(exc)}})
 

@@ -25,6 +25,12 @@ python3 -m unittest -v
 - `POST /api/objects/{id}/evidence`：上传证据，服务端计算 SHA-256。
 - `POST /api/objects/{id}/claims`：提交权利主张。
 - `POST /api/claims/{id}/transition`：按 `submitted → under_review → negotiating → resolved_return/rejected` 流转。
+- `POST /api/objects/{id}/attest`、`GET /api/objects/{id}/attestation`：来源签证与状态查询。
+- `POST /api/events/{id}/source`：为既有事件补登记来源。
 - `GET /api/objects/{id}/history` 与 `/history/{version}`：版本历史及历史快照。
 
 公众看不到持有人和内部事件；主张人只能查看自己的主张；阶段不能跳跃或从终态重新打开；每次对象变化都会保存 JSON 快照和审计记录。
+
+## 来源签证
+
+审查员对藏品当前版本签证：确认所有公开流转事件都有来源登记和内部证据，签证记录藏品版本号、材料指纹（SHA-256）和证据摘要。藏品登记信息、流转事件或证据有任何变化，签证即失效并给出具体失效原因；主张进入 `negotiating` 或 `resolved_return` 前必须持有有效签证，否则被 409 挡住。补齐材料（补登记来源、上传内部证据）后由审查员重新签证。公众与主张人只能看到签证状态与失效原因，看不到内部证据摘要。
