@@ -25,9 +25,9 @@ CLAIM_TRANSITIONS = {
 
 
 class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
+    def __init__(self, message, status=400, code="bad_request", details=None):
         super().__init__(message)
-        self.message, self.status, self.code = message, status, code
+        self.message, self.status, self.code, self.details = message, status, code, details
 
 
 def now():
@@ -107,6 +107,17 @@ class ProvenanceStore:
                     changed_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
                     UNIQUE(object_id,version)
                 );
+                CREATE TABLE IF NOT EXISTS visas(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    object_id INTEGER NOT NULL REFERENCES objects(id),
+                    object_version INTEGER NOT NULL,
+                    digest TEXT NOT NULL, object_digest TEXT NOT NULL,
+                    events_digest TEXT NOT NULL, evidence_digest TEXT NOT NULL,
+                    summary TEXT NOT NULL, note TEXT NOT NULL,
+                    reviewer_id TEXT NOT NULL REFERENCES users(id),
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','superseded')),
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, object_id INTEGER REFERENCES objects(id),
                     actor_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL,
@@ -127,6 +138,23 @@ class ProvenanceStore:
                     ("public", "公众访客", "public"),
                 ],
             )
+
+    def seed_demo(self):
+        """幂等写入演示数据：一件材料不全的藏品和一条待审主张。"""
+        self.seed()
+        with self.connect() as conn:
+            if conn.execute("SELECT 1 FROM objects WHERE inventory_no='M-2026-1'").fetchone():
+                return
+        source = self.add_source("staff", "海关出口档案", "archive", "CUS-1937-114")
+        obj = self.create_object("staff", "M-2026-1", "唐代彩绘陶俑", "陶俑", "市博物馆",
+                                 "1937年出境，1988年购回入藏，来源持续核验中。")
+        self.add_event("staff", obj["id"], "export", "1937-05-11", "", "上海",
+                       "经上海口岸出境至海外藏家", None, "public")
+        ev2 = self.add_event("staff", obj["id"], "acquisition", "1988-03-02", "", "本市",
+                             "自海外拍卖行购回入藏", source["id"], "public")
+        self.upload_evidence("staff", obj["id"], "1988购藏发票扫描.pdf",
+                             base64.b64encode(b"1988 purchase invoice scan").decode(), "internal", ev2["id"])
+        self.create_claim("claimant1", obj["id"], "原藏家后人", "返还陶俑")
 
     def _user(self, conn, user_id, roles=None):
         if not user_id:
@@ -264,6 +292,146 @@ class ProvenanceStore:
             self._audit(conn, object_id, user_id, "evidence.upload", {"evidence_id": cur.lastrowid, "sha256": digest, "visibility": visibility})
             return {"id": cur.lastrowid, "filename": filename.strip(), "sha256": digest, "size": len(content)}
 
+    def attach_event_source(self, user_id, object_id, event_id, source_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff"})
+            row = self._object(conn, object_id)
+            event = conn.execute("SELECT * FROM events WHERE id=? AND object_id=?", (event_id, object_id)).fetchone()
+            if not event:
+                raise BusinessError("事件不存在", 404, "event_not_found")
+            if not source_id or not conn.execute("SELECT 1 FROM sources WHERE id=?", (source_id,)).fetchone():
+                raise BusinessError("来源不存在", 404, "source_not_found")
+            conn.execute("UPDATE events SET source_id=? WHERE id=?", (source_id, event_id))
+            new_version = row["version"] + 1
+            conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (new_version, now(), object_id))
+            self._snapshot(conn, object_id, user_id)
+            self._audit(conn, object_id, user_id, "event.attach_source", {"event_id": event_id, "source_id": source_id, "version": new_version})
+            return {"event_id": event_id, "source_id": source_id, "object_version": new_version}
+
+    @staticmethod
+    def _hash_section(value):
+        canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _provenance_digests(self, conn, object_id):
+        """对藏品登记信息、全部流转事件（含来源）、全部证据分别取摘要。"""
+        obj = self._object(conn, object_id)
+        events = []
+        for e in conn.execute("SELECT * FROM events WHERE object_id=? ORDER BY id", (object_id,)).fetchall():
+            source = None
+            if e["source_id"]:
+                found = conn.execute("SELECT id,name,source_type,reference FROM sources WHERE id=?", (e["source_id"],)).fetchone()
+                source = dict(found) if found else None
+            linked = [dict(x) for x in conn.execute(
+                "SELECT id,filename,sha256,size,visibility FROM evidence WHERE event_id=? ORDER BY id", (e["id"],)).fetchall()]
+            events.append({
+                "id": e["id"], "event_type": e["event_type"], "date_start": e["date_start"], "date_end": e["date_end"],
+                "place": e["place"], "description": e["description"], "visibility": e["visibility"],
+                "source": source, "evidence": linked,
+            })
+        unlinked = [dict(x) for x in conn.execute(
+            "SELECT id,filename,sha256,size,visibility FROM evidence WHERE object_id=? AND event_id IS NULL ORDER BY id", (object_id,)).fetchall()]
+        object_section = {k: obj[k] for k in ("id", "inventory_no", "title", "object_type", "current_holder", "public_summary")}
+        event_section = [{k: v for k, v in e.items() if k != "evidence"} for e in events]
+        evidence_section = {"linked": {str(e["id"]): e["evidence"] for e in events}, "unlinked": unlinked}
+        return {
+            "object": self._hash_section(object_section),
+            "events": self._hash_section(event_section),
+            "evidence": self._hash_section(evidence_section),
+            "overall": self._hash_section({"object": object_section, "events": event_section, "evidence": evidence_section}),
+        }
+
+    def _visa_gaps(self, conn, object_id):
+        """签证前置条件缺口：每个公开事件都要有来源和至少一份内部证据。"""
+        public_events = conn.execute(
+            "SELECT * FROM events WHERE object_id=? AND visibility='public' ORDER BY id", (object_id,)).fetchall()
+        missing_source, missing_evidence = [], []
+        for e in public_events:
+            if not e["source_id"]:
+                missing_source.append(e["id"])
+            if not conn.execute("SELECT 1 FROM evidence WHERE event_id=? AND visibility='internal' LIMIT 1", (e["id"],)).fetchone():
+                missing_evidence.append(e["id"])
+        return {"public_event_count": len(public_events), "events_missing_source": missing_source,
+                "events_missing_internal_evidence": missing_evidence}
+
+    def _visa_invalidation_reasons(self, conn, visa, object_id):
+        digests = self._provenance_digests(conn, object_id)
+        reasons = []
+        if visa["status"] != "active":
+            reasons.append("签证已被重新签署取代")
+        if visa["object_digest"] != digests["object"]:
+            reasons.append("藏品登记信息已变更")
+        if visa["events_digest"] != digests["events"]:
+            reasons.append("流转事件或来源记录已变更")
+        if visa["evidence_digest"] != digests["evidence"]:
+            reasons.append("证据材料已变更")
+        return reasons, digests
+
+    def sign_visa(self, user_id, object_id, note=""):
+        note = note.strip() or "确认公开流转事件来源与内部证据齐全。"
+        with self.connect() as conn:
+            self._user(conn, user_id, {"reviewer"})
+            obj = self._object(conn, object_id)
+            gaps = self._visa_gaps(conn, object_id)
+            problems = []
+            if gaps["public_event_count"] == 0:
+                problems.append("藏品没有公开流转事件")
+            if gaps["events_missing_source"]:
+                problems.append("公开事件缺少来源: " + ",".join(str(i) for i in gaps["events_missing_source"]))
+            if gaps["events_missing_internal_evidence"]:
+                problems.append("公开事件缺少内部证据: " + ",".join(str(i) for i in gaps["events_missing_internal_evidence"]))
+            if problems:
+                raise BusinessError("；".join(problems), 422, "visa_requirements_unmet", gaps)
+            digests = self._provenance_digests(conn, object_id)
+            internal = conn.execute(
+                """SELECT e.sha256 FROM evidence e JOIN events ev ON e.event_id=ev.id
+                   WHERE ev.object_id=? AND ev.visibility='public' AND e.visibility='internal' ORDER BY e.id""",
+                (object_id,)).fetchall()
+            summary = {"public_events": gaps["public_event_count"], "internal_evidence": len(internal),
+                       "evidence_sha256": [r["sha256"] for r in internal]}
+            conn.execute("UPDATE visas SET status='superseded' WHERE object_id=? AND status='active'", (object_id,))
+            cur = conn.execute(
+                """INSERT INTO visas(object_id,object_version,digest,object_digest,events_digest,evidence_digest,summary,note,reviewer_id,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (object_id, obj["version"], digests["overall"], digests["object"], digests["events"], digests["evidence"],
+                 json.dumps(summary, ensure_ascii=False, sort_keys=True), note, user_id, now()))
+            self._audit(conn, object_id, user_id, "visa.sign",
+                        {"visa_id": cur.lastrowid, "object_version": obj["version"], "digest": digests["overall"]})
+            return {"id": cur.lastrowid, "object_id": object_id, "object_version": obj["version"],
+                    "digest": digests["overall"], "summary": summary, "note": note, "status": "active"}
+
+    def visa_status(self, user_id, object_id):
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            if user["role"] == "public":
+                raise BusinessError("公众无权查看来源签证", 403, "forbidden")
+            obj = self._object(conn, object_id)
+            visa = conn.execute("SELECT * FROM visas WHERE object_id=? ORDER BY id DESC LIMIT 1", (object_id,)).fetchone()
+            gaps = self._visa_gaps(conn, object_id)
+            if visa:
+                reasons, digests = self._visa_invalidation_reasons(conn, visa, object_id)
+            else:
+                digests = self._provenance_digests(conn, object_id)
+                reasons = ["尚未签署来源签证"]
+            valid = bool(visa) and not reasons
+            if user["role"] == "claimant":
+                return {"object_id": object_id, "valid": valid,
+                        "message": "来源签证有效" if valid else "来源签证未签署或已失效"}
+            result = {"object_id": object_id, "object_version": obj["version"], "current_digest": digests["overall"],
+                      "valid": valid, "reasons": reasons, "gaps": gaps, "visa": None}
+            if visa:
+                result["visa"] = dict(visa) | {"summary": json.loads(visa["summary"])}
+            return result
+
+    def _require_valid_visa(self, conn, object_id):
+        visa = conn.execute("SELECT * FROM visas WHERE object_id=? ORDER BY id DESC LIMIT 1", (object_id,)).fetchone()
+        if not visa:
+            raise BusinessError("主张进入协商或完成返还前，须由审查员签署来源签证", 409, "visa_required")
+        reasons, _ = self._visa_invalidation_reasons(conn, visa, object_id)
+        if reasons:
+            raise BusinessError("来源签证已失效：" + "；".join(reasons) + "。请补齐材料后由审查员重新签署",
+                                409, "visa_invalid", {"visa_id": visa["id"], "reasons": reasons})
+
     def create_claim(self, user_id, object_id, claimed_by, desired_outcome):
         if not claimed_by.strip() or not desired_outcome.strip():
             raise BusinessError("主张人和期望结果不能为空", 422, "invalid_claim")
@@ -291,6 +459,8 @@ class ProvenanceStore:
                 allowed = CLAIM_TRANSITIONS.get(claim["status"], set())
                 if new_status not in allowed:
                     raise BusinessError(f"不能从 {claim['status']} 直接变更为 {new_status}", 409, "invalid_transition")
+                if new_status in {"negotiating", "resolved_return"}:
+                    self._require_valid_visa(conn, claim["object_id"])
                 conn.execute("UPDATE claims SET status=?,updated_at=? WHERE id=?", (new_status, now(), claim_id))
                 conn.execute(
                     "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)",
@@ -343,6 +513,11 @@ class ProvenanceStore:
                 for c in result["claims"]:
                     c.pop("claimant_id", None)
             return result
+
+    def list_sources(self, user_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            return [dict(r) for r in conn.execute("SELECT * FROM sources ORDER BY id").fetchall()]
 
     def list_objects(self, user_id):
         with self.connect() as conn:
@@ -410,6 +585,7 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["api", "objects"] and method == "GET": return self._send(200, {"items": store.list_objects(user)})
         if parts == ["api", "objects"] and method == "POST":
             d = self._body(); return self._send(201, store.create_object(user, d.get("inventory_no", ""), d.get("title", ""), d.get("object_type", ""), d.get("current_holder", ""), d.get("public_summary", "")))
+        if parts == ["api", "sources"] and method == "GET": return self._send(200, {"items": store.list_sources(user)})
         if parts == ["api", "sources"] and method == "POST":
             d = self._body(); return self._send(201, store.add_source(user, d.get("name", ""), d.get("source_type", ""), d.get("reference", "")))
         if len(parts) >= 3 and parts[:2] == ["api", "objects"]:
@@ -422,6 +598,11 @@ class Handler(BaseHTTPRequestHandler):
                 d = self._body(); return self._send(201, store.upload_evidence(user, object_id, d.get("filename", ""), d.get("content_b64", ""), d.get("visibility", "internal"), d.get("event_id")))
             if len(parts) == 4 and parts[3] == "claims" and method == "POST":
                 d = self._body(); return self._send(201, store.create_claim(user, object_id, d.get("claimed_by", ""), d.get("desired_outcome", "")))
+            if len(parts) == 4 and parts[3] == "visa" and method == "GET": return self._send(200, store.visa_status(user, object_id))
+            if len(parts) == 5 and parts[3] == "visa" and parts[4] == "sign" and method == "POST":
+                d = self._body(); return self._send(201, store.sign_visa(user, object_id, d.get("note", "")))
+            if len(parts) == 6 and parts[3] == "events" and parts[5] == "source" and method == "POST":
+                d = self._body(); return self._send(200, store.attach_event_source(user, object_id, int(parts[4]), d.get("source_id")))
             if len(parts) == 4 and parts[3] == "history" and method == "GET": return self._send(200, {"items": store.object_history(user, object_id)})
             if len(parts) == 5 and parts[3] == "history" and method == "GET": return self._send(200, store.history_detail(user, object_id, int(parts[4])))
         if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "transition" and method == "POST":
@@ -430,7 +611,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle(self, method):
         try: self._dispatch(method)
-        except BusinessError as exc: self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+        except BusinessError as exc:
+            payload = {"error": {"code": exc.code, "message": exc.message}}
+            if exc.details is not None: payload["error"]["details"] = exc.details
+            self._send(exc.status, payload)
         except (ValueError, TypeError): self._send(400, {"error": {"code": "invalid_path", "message": "路径参数格式错误"}})
         except Exception as exc: self._send(500, {"error": {"code": "internal_error", "message": str(exc)}})
 
@@ -449,7 +633,7 @@ def main():
     parser.add_argument("--db", default=str(DEFAULT_DB)); parser.add_argument("--port", type=int, default=8103)
     parser.add_argument("--init", action="store_true"); parser.add_argument("--seed", action="store_true")
     args = parser.parse_args(); store = ProvenanceStore(args.db); store.init_schema()
-    if args.seed: store.seed()
+    if args.seed: store.seed_demo()
     if args.init or args.seed: print(f"数据库已初始化: {args.db}"); return
     server = ProvenanceServer(("127.0.0.1", args.port), store)
     print(f"来源审查系统运行于 http://127.0.0.1:{args.port}")

@@ -1,4 +1,207 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>藏品来源与返还审查</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>藏品来源与返还审查</h1><div class="panel"><select id="user"><option>staff</option><option>reviewer1</option><option>claimant1</option><option>public</option></select><button onclick="load()">查看当前角色可见藏品</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch("/api/objects",{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>藏品来源与返还审查 · 来源签证</title>
+<style>
+body{font:15px/1.55 system-ui,sans-serif;max-width:1080px;margin:24px auto;padding:0 16px;color:#222}
+h1{font-size:22px}h2{font-size:16px;margin:0 0 8px}
+.panel{border:1px solid #ccc;border-radius:8px;padding:14px;margin:10px 0}
+select,button,input{padding:6px;margin:3px;font:inherit}button{cursor:pointer}
+.badge{display:inline-block;padding:2px 12px;border-radius:12px;color:#fff;font-weight:600}
+.ok{background:#2e7d32}.bad{background:#c62828}.none{background:#757575}
+table{border-collapse:collapse;width:100%;margin:6px 0}td,th{border:1px solid #ddd;padding:5px 8px;text-align:left;font-size:14px}
+.reasons{color:#c62828}.gaps{color:#e65100}.muted{color:#666}.tag{background:#eee;border-radius:4px;padding:1px 6px;font-size:12px}
+pre{background:#f5f5f5;padding:10px;white-space:pre-wrap;max-height:280px;overflow:auto;font-size:13px}
+.row{display:flex;gap:14px;flex-wrap:wrap}.row>.panel{flex:1;min-width:340px}
+fieldset{border:1px solid #ddd;border-radius:6px;margin:8px 0}legend{font-weight:600;font-size:14px}
+input[type=number]{width:80px}
+</style></head>
+<body>
+<h1>藏品来源与返还审查 · 来源签证演示</h1>
+<div class="panel">
+  角色：<select id="user" onchange="refresh()">
+    <option value="staff">staff · 藏品研究员</option>
+    <option value="reviewer1">reviewer1 · 返还审查员</option>
+    <option value="claimant1">claimant1 · 权利主张人</option>
+    <option value="public">public · 公众访客</option>
+  </select>
+  藏品：<select id="obj" onchange="loadDetail().then(renderAll)"></select>
+  <button onclick="refresh()">刷新</button>
+  <button onclick="runDemo()">▶ 一键演示复审流程</button>
+  <div class="muted" id="roleHint"></div>
+</div>
+<div class="row">
+  <div class="panel"><h2>来源签证</h2><div id="visaBody" class="muted">加载中…</div></div>
+  <div class="panel"><h2>藏品</h2><div id="objBody" class="muted">加载中…</div></div>
+</div>
+<div class="panel"><h2>流转事件与材料核对</h2><div id="eventsBody"></div></div>
+<div class="panel"><h2>权利主张</h2><div id="claimsBody"></div></div>
+<div class="panel"><h2>操作（按当前角色）</h2><div id="actionBody"></div></div>
+<div class="panel"><h2>日志</h2><pre id="log"></pre></div>
+<script>
+const $=id=>document.getElementById(id);
+const b64=s=>btoa(unescape(encodeURIComponent(s)));
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const short=h=>h?h.slice(0,12)+"…":"—";
+let objects=[],sources=[],detail=null,visa=null;
+const ROLE_HINT={staff:"可登记藏品、事件、来源，并为事件补来源、补传证据。",reviewer1:"可签署来源签证、查看失效原因并流转主张阶段。",claimant1:"可提交主张，只能看到签证是否有效。",public:"只读公开信息，看不到签证。"};
+
+async function api(method,path,body,asUser){
+  const opt={method,headers:{"X-User-Id":asUser||$("user").value}};
+  if(body!=null){opt.headers["Content-Type"]="application/json";opt.body=JSON.stringify(body);}
+  const r=await fetch(path,opt),data=await r.json().catch(()=>({}));
+  if(!r.ok){const e=new Error(data.error?.message||r.statusText);e.data=data;throw e;}
+  return data;
+}
+function say(m){const l=$("log");l.textContent+=m+"\n";l.scrollTop=l.scrollHeight;}
+function sayErr(prefix,e){say(prefix+(e.data?.error?`${e.data.error.code}: ${e.data.error.message}`:e.message));}
+
+async function refresh(){
+  const keep=$("obj").value,role=$("user").value;
+  $("roleHint").textContent=ROLE_HINT[role]||"";
+  objects=(await api("GET","/api/objects")).items;
+  $("obj").innerHTML=objects.map(o=>`<option value="${o.id}">#${o.id} ${esc(o.inventory_no)} ${esc(o.title)} (v${o.version})</option>`).join("");
+  if(keep&&objects.some(o=>String(o.id)===keep))$("obj").value=keep;
+  sources=[];
+  if(role==="staff"||role==="reviewer1"){try{sources=(await api("GET","/api/sources")).items;}catch(e){}}
+  await loadDetail();renderAll();
+}
+async function loadDetail(){
+  const id=$("obj").value;
+  if(!id){detail=null;visa=null;return;}
+  detail=await api("GET",`/api/objects/${id}`);
+  try{visa=await api("GET",`/api/objects/${id}/visa`);}catch(e){visa={error:e.data?.error?.message||e.message};}
+}
+
+function renderAll(){renderVisa();renderObject();renderEvents();renderClaims();renderActions();}
+
+function renderVisa(){
+  const b=$("visaBody"),role=$("user").value;
+  if(!detail){b.innerHTML="请选择藏品";return;}
+  if(visa&&visa.error){b.innerHTML=`<span class="muted">${esc(visa.error)}</span>`;return;}
+  if(!visa){b.innerHTML="…";return;}
+  if(role==="claimant1"){b.innerHTML=visa.valid?`<span class="badge ok">来源签证有效</span>`:`<span class="badge bad">来源签证未签署或已失效</span>`;return;}
+  let h=visa.valid?`<span class="badge ok">有效</span>`:(visa.visa?`<span class="badge bad">已失效</span>`:`<span class="badge none">未签署</span>`);
+  h+=` <span class="muted">当前版本 v${visa.object_version} · 当前摘要 ${short(visa.current_digest)}</span>`;
+  const v=visa.visa;
+  if(v)h+=`<table><tr><th>签证</th><td>#${v.id} · 签于 v${v.object_version} · ${esc(v.reviewer_id)} · ${esc(v.created_at)}</td></tr>
+<tr><th>备注</th><td>${esc(v.note)}</td></tr>
+<tr><th>证据摘要</th><td>${short(v.digest)}（公开事件 ${v.summary.public_events} 个 · 内部证据 ${v.summary.internal_evidence} 份）</td></tr>
+<tr><th>状态</th><td>${esc(v.status)}</td></tr></table>`;
+  if(visa.reasons?.length)h+=`<div class="reasons">${visa.visa?"失效原因":"未签原因"}：<ul>${visa.reasons.map(r=>`<li>${esc(r)}</li>`).join("")}</ul></div>`;
+  const g=visa.gaps;
+  if(g){const miss=[];
+    if(g.events_missing_source.length)miss.push(`缺来源的事件 #${g.events_missing_source.join("、#")}`);
+    if(g.events_missing_internal_evidence.length)miss.push(`缺内部证据的事件 #${g.events_missing_internal_evidence.join("、#")}`);
+    h+=`<div class="gaps">公开事件 ${g.public_event_count} 个；${miss.length?miss.join("；"):"来源与内部证据齐全 ✓"}</div>`;}
+  b.innerHTML=h;
+}
+
+function renderObject(){
+  if(!detail){$("objBody").innerHTML="请选择藏品";return;}
+  const o=detail;
+  $("objBody").innerHTML=`<table>
+<tr><th>库存号</th><td>${esc(o.inventory_no)}</td></tr>
+<tr><th>标题</th><td>${esc(o.title)}</td></tr>
+<tr><th>类型</th><td>${esc(o.object_type)}</td></tr>
+${o.current_holder?`<tr><th>当前持有人</th><td>${esc(o.current_holder)}</td></tr>`:""}
+<tr><th>版本</th><td>v${o.version}</td></tr>
+<tr><th>公开简介</th><td>${esc(o.public_summary)}</td></tr></table>`;
+}
+
+function renderEvents(){
+  const b=$("eventsBody");if(!detail){b.innerHTML="";return;}
+  const role=$("user").value,full=role==="staff"||role==="reviewer1";
+  if(!detail.events?.length){b.innerHTML='<span class="muted">暂无流转事件</span>';return;}
+  if(!full){b.innerHTML="<ul>"+detail.events.map(e=>`<li>[${esc(e.event_type)}] ${esc(e.date_start)} · ${esc(e.place)} — ${esc(e.description)}</li>`).join("")+"</ul>";return;}
+  b.innerHTML=`<table><tr><th>ID</th><th>类型</th><th>日期</th><th>地点</th><th>可见性</th><th>来源</th><th>内部证据</th></tr>`+
+    detail.events.map(e=>{
+      const internal=(e.evidence||[]).filter(x=>x.visibility==="internal");
+      return `<tr><td>${e.id}</td><td>${esc(e.event_type)}</td><td>${esc(e.date_start)}</td><td>${esc(e.place)}</td>
+<td><span class="tag">${esc(e.visibility)}</span></td>
+<td>${e.source?`#${e.source.id} ${esc(e.source.name)}`:"<b class='reasons'>✗ 缺来源</b>"}</td>
+<td>${e.visibility==="public"?(internal.length?`✓ ${internal.length} 份`:"<b class='reasons'>✗ 缺内部证据</b>"):"—"}</td></tr>`;
+    }).join("")+"</table>";
+}
+
+function renderClaims(){
+  const b=$("claimsBody");if(!detail){b.innerHTML="";return;}
+  const claims=detail.claims||[];
+  if(!claims.length){b.innerHTML='<span class="muted">暂无主张</span>';return;}
+  b.innerHTML=`<table><tr><th>ID</th><th>主张人</th><th>期望结果</th><th>状态</th></tr>`+
+    claims.map(c=>`<tr><td>${c.id}</td><td>${esc(c.claimed_by)}</td><td>${esc(c.desired_outcome)}</td><td><span class="tag">${esc(c.status)}</span></td></tr>`).join("")+"</table>";
+}
+
+function renderActions(){
+  const b=$("actionBody"),role=$("user").value,srcOpts=sources.map(s=>`<option value="${s.id}">#${s.id} ${esc(s.name)}</option>`).join("");
+  if(role==="staff")b.innerHTML=`
+<fieldset><legend>新建来源</legend>名称 <input id="srcName" size="12"> 引用编号 <input id="srcRef" size="12"> <button onclick="addSource()">保存</button></fieldset>
+<fieldset><legend>新建流转事件</legend>类型 <input id="evType" size="10" value="exhibition"> 日期 <input id="evDate" type="date"> 地点 <input id="evPlace" size="8"> 说明 <input id="evDesc" size="16"> 来源 <select id="evSource"><option value="">（无）</option>${srcOpts}</select> 可见性 <select id="evVis"><option>public</option><option>internal</option></select> <button onclick="addEvent()">保存</button></fieldset>
+<fieldset><legend>为事件补来源</legend>事件 ID <input id="fixEventId" type="number"> 来源 <select id="fixSource">${srcOpts}</select> <button onclick="attachSource()">补齐</button></fieldset>
+<fieldset><legend>上传证据</legend>关联事件 ID <input id="evidEventId" type="number"> 文件名 <input id="evidName" size="16" value="补充材料.pdf"> 可见性 <select id="evidVis"><option>internal</option><option>public</option></select> 内容 <input id="evidContent" size="20" placeholder="文本内容，服务端计算 SHA-256"> <button onclick="uploadEvidence()">上传</button></fieldset>
+<fieldset><legend>更新公开摘要</legend><input id="sumText" size="50"> <button onclick="updateSummary()">更新</button></fieldset>`;
+  else if(role==="reviewer1"){
+    const claimOpts=(detail?.claims||[]).map(c=>`<option value="${c.id}">#${c.id} ${esc(c.claimed_by)}（${esc(c.status)}）</option>`).join("");
+    b.innerHTML=`
+<fieldset><legend>签署来源签证（复审后重签也用此操作）</legend>备注 <input id="visaNote" size="46" placeholder="确认公开流转事件来源与内部证据齐全。"> <button onclick="signVisa()">签署签证</button></fieldset>
+<fieldset><legend>主张阶段流转</legend>主张 <select id="claimSel">${claimOpts}</select> 目标阶段 <select id="claimTarget"><option value="under_review">under_review</option><option value="negotiating">negotiating</option><option value="resolved_return">resolved_return</option><option value="rejected">rejected</option></select> 说明 <input id="claimNote" size="26"> <button onclick="transitionClaim()">提交流转</button>
+<div class="muted">进入 negotiating / resolved_return 前系统会校验来源签证，失效将被拦截。</div></fieldset>`;
+  }
+  else if(role==="claimant1")b.innerHTML=`
+<fieldset><legend>提交权利主张</legend>主张人 <input id="clBy" size="14"> 期望结果 <input id="clWant" size="14" value="返还藏品"> <button onclick="createClaim()">提交</button></fieldset>`;
+  else b.innerHTML='<span class="muted">公众角色为只读，可切换其他角色体验签证与复审操作。</span>';
+}
+
+async function act(fn){try{await fn();}catch(e){sayErr("操作失败：",e);}await refresh();}
+const oid=()=>$("obj").value;
+function addSource(){act(async()=>{const r=await api("POST","/api/sources",{name:$("srcName").value,source_type:"archive",reference:$("srcRef").value});say(`来源已保存 #${r.id} ${r.name}`);});}
+function addEvent(){act(async()=>{const r=await api("POST",`/api/objects/${oid()}/events`,{event_type:$("evType").value,date_start:$("evDate").value,date_end:"",place:$("evPlace").value,description:$("evDesc").value,source_id:$("evSource").value?Number($("evSource").value):null,visibility:$("evVis").value});say(`事件已保存 #${r.id}（藏品升至 v${r.object_version}）`);});}
+function attachSource(){act(async()=>{const r=await api("POST",`/api/objects/${oid()}/events/${$("fixEventId").value}/source`,{source_id:Number($("fixSource").value)});say(`事件 #${r.event_id} 已补来源 #${r.source_id}（藏品升至 v${r.object_version}）`);});}
+function uploadEvidence(){act(async()=>{const ev=$("evidEventId").value;const r=await api("POST",`/api/objects/${oid()}/evidence`,{filename:$("evidName").value,content_b64:b64($("evidContent").value||" "),visibility:$("evidVis").value,event_id:ev?Number(ev):null});say(`证据已上传 #${r.id} sha256=${r.sha256.slice(0,12)}…`);});}
+function updateSummary(){act(async()=>{const r=await api("POST",`/api/objects/${oid()}/update`,{changes:{public_summary:$("sumText").value}});say(`藏品已更新至 v${r.version}`);});}
+function signVisa(){act(async()=>{const r=await api("POST",`/api/objects/${oid()}/visa/sign`,{note:$("visaNote").value});say(`签证 #${r.id} 已签署：签于 v${r.object_version}，摘要 ${r.digest.slice(0,12)}…`);});}
+function transitionClaim(){act(async()=>{const r=await api("POST",`/api/claims/${$("claimSel").value}/transition`,{status:$("claimTarget").value,note:$("claimNote").value});say(`主张 #${r.claim_id}：${r.old_status} → ${r.status}`);});}
+function createClaim(){act(async()=>{const r=await api("POST",`/api/objects/${oid()}/claims`,{claimed_by:$("clBy").value,desired_outcome:$("clWant").value});say(`主张已提交 #${r.id}`);});}
+
+async function runDemo(){
+  const ts=Date.now().toString(36);
+  say(`\n===== 复审演示开始（新建 DEMO-${ts}）=====`);
+  let objId;
+  try{
+    say("① staff：登记藏品与一条缺来源、缺内部证据的公开事件，claimant 提交主张");
+    const src=await api("POST","/api/sources",{name:`演示档案${ts}`,source_type:"archive",reference:"DEMO-"+ts},"staff");
+    const obj=await api("POST","/api/objects",{inventory_no:"DEMO-"+ts,title:"演示彩绘陶俑",object_type:"陶器",current_holder:"市博物馆",public_summary:"演示用藏品，来源核验中。"},"staff");
+    objId=obj.id;
+    const ev=await api("POST",`/api/objects/${objId}/events`,{event_type:"acquisition",date_start:"1988-03-02",date_end:"",place:"本市",description:"自海外拍卖行购回入藏",source_id:null,visibility:"public"},"staff");
+    const claim=await api("POST",`/api/objects/${objId}/claims`,{claimed_by:"原藏家后人",desired_outcome:"返还陶俑"},"claimant1");
+    say("② reviewer：材料不全，签署签证被拒");
+    try{await api("POST",`/api/objects/${objId}/visa/sign`,{note:"尝试签署"},"reviewer1");}
+    catch(e){say("   签署被拒 → "+e.data.error.message);}
+    say("③ staff：补挂来源、补传内部证据");
+    await api("POST",`/api/objects/${objId}/events/${ev.id}/source`,{source_id:src.id},"staff");
+    await api("POST",`/api/objects/${objId}/evidence`,{filename:"内部调查报告.pdf",content_b64:b64("内部调查报告：来源链核验记录"),visibility:"internal",event_id:ev.id},"staff");
+    say("④ reviewer：签署来源签证");
+    const v1=await api("POST",`/api/objects/${objId}/visa/sign`,{note:"材料齐全，予以签证。"},"reviewer1");
+    say(`   签证 #${v1.id} 签于 v${v1.object_version}，摘要 ${v1.digest.slice(0,12)}…`);
+    say("⑤ reviewer：主张进入审查与协商（签证有效，放行）");
+    await api("POST",`/api/claims/${claim.id}/transition`,{status:"under_review",note:"材料齐全，进入调查。"},"reviewer1");
+    await api("POST",`/api/claims/${claim.id}/transition`,{status:"negotiating",note:"签证有效，进入协商。"},"reviewer1");
+    say("⑥ staff：追加一条公开借展事件 → 签证随之失效");
+    const ev2=await api("POST",`/api/objects/${objId}/events`,{event_type:"exhibition",date_start:"1995-06-01",date_end:"",place:"省城",description:"借展",source_id:src.id,visibility:"public"},"staff");
+    const st=await api("GET",`/api/objects/${objId}/visa`,null,"reviewer1");
+    say("   失效原因 → "+st.reasons.join("；")+"；材料缺口 → 缺内部证据的事件 #"+st.gaps.events_missing_internal_evidence.join("、#"));
+    say("⑦ reviewer：完成返还被拦截");
+    try{await api("POST",`/api/claims/${claim.id}/transition`,{status:"resolved_return",note:"签署返还协议。"},"reviewer1");}
+    catch(e){say("   拦截 → "+e.data.error.message);}
+    say("⑧ staff：为新事件补内部证据，reviewer 复审后重签");
+    await api("POST",`/api/objects/${objId}/evidence`,{filename:"借展点交记录.pdf",content_b64:b64("借展点交记录与保险单"),visibility:"internal",event_id:ev2.id},"staff");
+    const v2=await api("POST",`/api/objects/${objId}/visa/sign`,{note:"复审通过，重新签署。"},"reviewer1");
+    say(`   重签 #${v2.id} 签于 v${v2.object_version}（旧签证已标记 superseded）`);
+    say("⑨ reviewer：完成返还");
+    await api("POST",`/api/claims/${claim.id}/transition`,{status:"resolved_return",note:"签证复核有效，完成返还。"},"reviewer1");
+    say("===== 演示完成：主张已 resolved_return ✔ =====");
+  }catch(e){sayErr("演示中断：",e);}
+  await refresh();
+  if(objId)$("obj").value=String(objId);
+  await loadDetail();renderAll();
+}
+refresh();
+</script>
+</body></html>
